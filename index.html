@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>DONUT DASH — a one-prompt game by Jett</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#12081f; overflow:hidden;
+    font-family:'Segoe UI', system-ui, sans-serif; -webkit-user-select:none; user-select:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background: radial-gradient(1200px 800px at 50% 20%, #2a1052 0%, #12081f 60%); }
+  canvas { display:block; border-radius:18px; box-shadow:0 0 60px rgba(255,77,205,.35), 0 0 140px rgba(80,200,255,.18);
+    touch-action:none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="540" height="960"></canvas></div>
+<script>
+'use strict';
+/* ============================================================
+   DONUT DASH
+   Built from ONE prompt by an AI agent:
+   "Build a fast, colorful browser game where a neon cat catches
+    falling donuts, dodges broccoli, with combo scores, lives,
+    and a big juicy game-over screen — all in one HTML file."
+   ============================================================ */
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = 540, H = 960;
+
+/* Fit canvas to the window while keeping the 9:16 stage. */
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width = (W * s) + 'px';
+  cv.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+/* ---------- deterministic RNG (mulberry32) ---------- */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const params = new URLSearchParams(location.search);
+const DEMO = params.get('demo') === '1';
+const rng = mulberry32(DEMO ? 20261124 : (Math.random() * 1e9) | 0);
+
+/* ---------- audio: tiny synth, no assets ---------- */
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  return AC;
+}
+function blip(freq, dur, type, vol, slide) {
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || 'sine'; o.frequency.setValueAtTime(freq, ac.currentTime);
+  if (slide) o.frequency.exponentialRampToValueAtTime(slide, ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.15, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + dur);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + dur);
+}
+const sfx = {
+  pop(combo) { blip(520 + combo * 60, 0.12, 'sine', 0.20, 900 + combo * 80); },
+  gold() { blip(880, 0.10, 'triangle', 0.22, 1320); setTimeout(() => blip(1320, 0.16, 'triangle', 0.20, 1760), 70); },
+  thud() { blip(160, 0.22, 'sawtooth', 0.16, 60); },
+  over() { blip(392, 0.18, 'square', 0.12); setTimeout(() => blip(330, 0.18, 'square', 0.12), 160); setTimeout(() => blip(262, 0.34, 'square', 0.12), 320); }
+};
+
+/* ---------- game state ---------- */
+const S = {
+  mode: 'title',           // title | play | over
+  time: 0,                 // seconds, in fixed steps
+  score: 0, best: 0,
+  lives: 3, combo: 0, mult: 1,
+  shake: 0, flash: 0,
+  items: [], parts: [], pops: [],
+  spawnIn: 0.5,
+  cat: { x: W / 2, vx: 0, blink: 0, happy: 0 },
+  keys: {}, pointerX: null,
+  overAt: 0
+};
+
+const DONUT_COLORS = [
+  ['#ff5da2', '#ffd166'], ['#4dc9ff', '#c084fc'], ['#7CFC9a', '#fef08a'],
+  ['#ff8a5c', '#fda4af'], ['#c084fc', '#f9a8d4'], ['#5eead4', '#a5f3fc']
+];
+
+function spawnItem() {
+  const r = rng();
+  let kind = 'donut';
+  if (r > 0.93) kind = 'gold';
+  else if (r > 0.72) kind = 'broccoli';
+  const speedBase = 285 + Math.min(300, S.time * 8);
+  S.items.push({
+    kind,
+    x: 50 + rng() * (W - 100),
+    y: -50,
+    vy: speedBase * (0.85 + rng() * 0.4),
+    rot: rng() * Math.PI * 2,
+    vr: (rng() - 0.5) * 2.4,
+    wob: rng() * Math.PI * 2,
+    ci: (rng() * DONUT_COLORS.length) | 0,
+    r: kind === 'gold' ? 30 : 27
+  });
+}
+
+function burst(x, y, color, n, power) {
+  for (let i = 0; i < n; i++) {
+    const a = rng() * Math.PI * 2, sp = (0.3 + rng() * 0.7) * (power || 190);
+    S.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60, life: 0.55 + rng() * 0.3, t: 0, color, r: 2.5 + rng() * 3.5 });
+  }
+}
+function popup(x, y, text, color, big) {
+  S.pops.push({ x, y, text, color, t: 0, big: !!big });
+}
+
+/* ---------- update (fixed step 1/60) ---------- */
+function step(dt) {
+  S.time += dt;
+  const cat = S.cat;
+  cat.blink = (cat.blink + dt) % 3.7;
+  if (cat.happy > 0) cat.happy -= dt;
+
+  if (S.mode === 'play') {
+    /* steering */
+    let target = null;
+    if (DEMO) {
+      /* the demo pilot chases the nearest catchable donut, flees broccoli */
+      let bestD = 1e9, threat = null;
+      for (const it of S.items) {
+        if (it.y < -20 || it.y > H - 190) continue;
+        if (it.kind === 'broccoli') { if (Math.abs(it.x - cat.x) < 90 && it.y > H - 420) threat = it; continue; }
+        const d = Math.abs(it.x - cat.x) + Math.max(0, (H - 210 - it.y)) * 0.12;
+        if (d < bestD) { bestD = d; target = it.x; }
+      }
+      if (threat) target = cat.x + (cat.x < threat.x ? -170 : 170);
+      if (target === null) target = W / 2 + Math.sin(S.time * 0.9) * 120;
+    } else {
+      if (S.pointerX !== null) target = S.pointerX;
+      let mv = 0;
+      if (S.keys.ArrowLeft || S.keys.KeyA) mv -= 1;
+      if (S.keys.ArrowRight || S.keys.KeyD) mv += 1;
+      if (mv !== 0) { cat.vx = mv * 640; target = null; }
+      else if (target === null) cat.vx *= 0.8;
+    }
+    if (target !== null) {
+      const dx = target - cat.x;
+      cat.vx = Math.max(-760, Math.min(760, dx * 14));
+    }
+    cat.x += cat.vx * dt;
+    cat.x = Math.max(46, Math.min(W - 46, cat.x));
+
+    /* spawning */
+    S.spawnIn -= dt;
+    const interval = Math.max(0.26, 0.60 - S.time * 0.005);
+    if (S.spawnIn <= 0) { spawnItem(); S.spawnIn = interval * (0.7 + rng() * 0.6); }
+
+    /* items */
+    const mouthY = H - 118;
+    for (let i = S.items.length - 1; i >= 0; i--) {
+      const it = S.items[i];
+      it.y += it.vy * dt; it.rot += it.vr * dt; it.wob += dt * 3;
+      const dx = it.x - cat.x, dy = it.y - mouthY;
+      if (it.y > H - 190 && it.y < H - 40 && Math.abs(dx) < 52 && dy > -46 && dy < 40) {
+        /* caught in the cat's zone */
+        if (it.kind === 'broccoli') {
+          S.lives--; S.combo = 0; S.mult = 1; S.shake = 0.45; S.flash = 0.35;
+          burst(it.x, it.y, '#4ade80', 16, 220); popup(it.x, it.y - 30, 'YUCK!', '#4ade80');
+          sfx.thud();
+          if (S.lives <= 0) { S.mode = 'over'; S.overAt = S.time; S.best = Math.max(S.best, S.score); sfx.over(); }
+        } else {
+          S.combo++; S.mult = Math.min(5, 1 + ((S.combo / 6) | 0));
+          const pts = (it.kind === 'gold' ? 50 : 10) * S.mult;
+          S.score += pts; cat.happy = 0.28;
+          burst(it.x, it.y, it.kind === 'gold' ? '#ffd700' : DONUT_COLORS[it.ci][0], it.kind === 'gold' ? 26 : 14, 200);
+          popup(it.x, it.y - 34, '+' + pts, it.kind === 'gold' ? '#ffd700' : '#ffffff', it.kind === 'gold');
+          if (it.kind === 'gold') sfx.gold(); else sfx.pop(Math.min(8, S.combo));
+        }
+        S.items.splice(i, 1); continue;
+      }
+      if (it.y > H + 60) {
+        if (it.kind !== 'broccoli') { S.combo = 0; S.mult = 1; }
+        S.items.splice(i, 1);
+      }
+    }
+  }
+
+  /* particles & popups */
+  for (let i = S.parts.length - 1; i >= 0; i--) {
+    const p = S.parts[i]; p.t += dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt;
+    if (p.t > p.life) S.parts.splice(i, 1);
+  }
+  for (let i = S.pops.length - 1; i >= 0; i--) {
+    const p = S.pops[i]; p.t += dt; p.y -= 44 * dt;
+    if (p.t > 0.9) S.pops.splice(i, 1);
+  }
+  if (S.shake > 0) S.shake -= dt;
+  if (S.flash > 0) S.flash -= dt;
+}
+
+function startGame() {
+  S.mode = 'play'; S.score = 0; S.lives = 3; S.combo = 0; S.mult = 1;
+  S.items.length = 0; S.parts.length = 0; S.pops.length = 0; S.spawnIn = 0.4; S.time = 0;
+  /* pre-roll two donuts so the action starts instantly, no empty sky */
+  spawnItem(); S.items[S.items.length - 1].y = 120;
+  spawnItem(); const last = S.items[S.items.length - 1]; last.y = 300; last.kind = 'donut';
+}
+
+/* ---------- drawing ---------- */
+function drawDonut(it) {
+  ctx.save(); ctx.translate(it.x, it.y); ctx.rotate(it.rot);
+  const [frost, sprinkle] = it.kind === 'gold' ? ['#ffd700', '#fff7cc'] : DONUT_COLORS[it.ci];
+  ctx.shadowColor = frost; ctx.shadowBlur = 16;
+  ctx.fillStyle = '#e8a860';
+  ctx.beginPath(); ctx.arc(0, 0, it.r, 0, 7); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = frost;
+  ctx.beginPath();
+  for (let a = 0; a <= 12; a++) {
+    const ang = (a / 12) * Math.PI * 2, rr = it.r * (0.86 + 0.10 * Math.sin(ang * 3 + it.wob));
+    const px = Math.cos(ang) * rr, py = Math.sin(ang) * rr;
+    if (a === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = sprinkle;
+  for (let i = 0; i < 7; i++) {
+    const ang = i * 2.39 + it.wob, rr = it.r * 0.52;
+    ctx.save(); ctx.translate(Math.cos(ang) * rr, Math.sin(ang) * rr); ctx.rotate(ang * 2);
+    ctx.fillRect(-4, -1.4, 8, 2.8); ctx.restore();
+  }
+  ctx.fillStyle = '#2a1052';
+  ctx.beginPath(); ctx.arc(0, 0, it.r * 0.34, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function drawBroccoli(it) {
+  ctx.save(); ctx.translate(it.x, it.y); ctx.rotate(Math.sin(it.wob) * 0.25);
+  ctx.fillStyle = '#a3e635';
+  ctx.beginPath(); ctx.moveTo(-6, 4); ctx.lineTo(6, 4); ctx.lineTo(3, 30); ctx.lineTo(-3, 30); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#22c55e'; ctx.shadowColor = '#22c55e'; ctx.shadowBlur = 12;
+  for (const [ox, oy, r] of [[-14, -4, 13], [0, -14, 16], [14, -4, 13], [-7, 6, 12], [8, 6, 12]]) {
+    ctx.beginPath(); ctx.arc(ox, oy, r, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawCat() {
+  const cat = S.cat, x = cat.x, y = H - 96;
+  ctx.save(); ctx.translate(x, y);
+  if (S.shake > 0) ctx.translate((rng() - 0.5) * 10 * S.shake, (rng() - 0.5) * 6 * S.shake);
+  /* tail */
+  ctx.strokeStyle = '#ff5da2'; ctx.lineWidth = 9; ctx.lineCap = 'round';
+  ctx.shadowColor = '#ff5da2'; ctx.shadowBlur = 14;
+  ctx.beginPath(); ctx.moveTo(-30, 34);
+  ctx.quadraticCurveTo(-58, 30 + Math.sin(S.time * 5) * 7, -54, 6); ctx.stroke();
+  /* ears */
+  ctx.fillStyle = '#1d2b64';
+  ctx.beginPath(); ctx.moveTo(-40, -22); ctx.lineTo(-46, -58); ctx.lineTo(-14, -40); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(40, -22); ctx.lineTo(46, -58); ctx.lineTo(14, -40); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#ff5da2';
+  ctx.beginPath(); ctx.moveTo(-37, -28); ctx.lineTo(-40, -48); ctx.lineTo(-22, -36); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(37, -28); ctx.lineTo(40, -48); ctx.lineTo(22, -36); ctx.closePath(); ctx.fill();
+  /* head */
+  const g = ctx.createRadialGradient(-12, -16, 8, 0, 0, 56);
+  g.addColorStop(0, '#3b4a8f'); g.addColorStop(1, '#1d2b64');
+  ctx.fillStyle = g; ctx.shadowBlur = 22;
+  ctx.beginPath(); ctx.arc(0, 0, 52, 0, 7); ctx.fill();
+  ctx.shadowBlur = 0;
+  /* eyes */
+  const blink = cat.blink > 3.55 || (S.mode === 'play' && cat.happy > 0);
+  ctx.fillStyle = '#a5f3fc';
+  if (blink) {
+    ctx.fillRect(-30, -8, 18, 3.4); ctx.fillRect(12, -8, 18, 3.4);
+  } else {
+    ctx.beginPath(); ctx.ellipse(-21, -8, 8.5, 11, 0, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(21, -8, 8.5, 11, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#0b1026';
+    ctx.beginPath(); ctx.ellipse(-21, -7, 4, 7.5, 0, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(21, -7, 4, 7.5, 0, 0, 7); ctx.fill();
+  }
+  /* nose + mouth */
+  ctx.fillStyle = '#ff5da2';
+  ctx.beginPath(); ctx.moveTo(-5, 6); ctx.lineTo(5, 6); ctx.lineTo(0, 12); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#a5f3fc'; ctx.lineWidth = 2.4;
+  const open = S.mode === 'play' && S.items.some(it => Math.abs(it.x - x) < 60 && it.y > H - 330 && it.y < H - 150);
+  ctx.beginPath();
+  if (open || cat.happy > 0) { ctx.arc(0, 14, 9, 0.15 * Math.PI, 0.85 * Math.PI); }
+  else { ctx.moveTo(-7, 17); ctx.quadraticCurveTo(0, 21, 7, 17); }
+  ctx.stroke();
+  /* whiskers */
+  ctx.strokeStyle = 'rgba(165,243,252,.75)'; ctx.lineWidth = 2;
+  for (const sgn of [-1, 1]) for (let i = 0; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(sgn * 34, 2 + i * 6);
+    ctx.lineTo(sgn * 62, -3 + i * 8); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* background stars, pre-rolled with the same seeded rng */
+const STARS = [];
+for (let i = 0; i < 90; i++) STARS.push({ x: rng() * W, y: rng() * H, r: 0.8 + rng() * 1.9, p: rng() * 7 });
+
+function drawBG() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#2a1052'); g.addColorStop(0.55, '#3b1163'); g.addColorStop(1, '#12081f');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  for (const st of STARS) {
+    const tw = 0.55 + 0.45 * Math.sin(S.time * 2 + st.p);
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.5 * tw) + ')';
+    ctx.beginPath(); ctx.arc(st.x, (st.y + S.time * 12 * st.r) % H, st.r, 0, 7); ctx.fill();
+  }
+  /* floor glow */
+  const fg = ctx.createRadialGradient(W / 2, H - 30, 30, W / 2, H - 30, 340);
+  fg.addColorStop(0, 'rgba(255,93,162,.28)'); fg.addColorStop(1, 'rgba(255,93,162,0)');
+  ctx.fillStyle = fg; ctx.fillRect(0, H - 260, W, 260);
+  ctx.strokeStyle = 'rgba(255,93,162,.5)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(24, H - 26); ctx.lineTo(W - 24, H - 26); ctx.stroke();
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillStyle = 'rgba(10,6,24,.45)';
+  ctx.beginPath(); ctx.roundRect(14, 14, 218, 64, 14); ctx.fill();
+  ctx.fillStyle = '#ffffff'; ctx.font = '900 34px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText(String(S.score), 30, 24);
+  ctx.fillStyle = '#ffd166'; ctx.font = '700 15px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText('SCORE', 31, 60 - 6);
+  /* combo meter */
+  if (S.combo >= 2) {
+    const wbar = Math.min(1, S.combo / 24) * 150;
+    ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.beginPath(); ctx.roundRect(30, 66, 150, 7, 4); ctx.fill();
+    ctx.fillStyle = '#ff5da2'; ctx.beginPath(); ctx.roundRect(30, 66, wbar, 7, 4); ctx.fill();
+    ctx.fillStyle = '#ffb3d9'; ctx.font = '800 17px "Segoe UI", system-ui, sans-serif';
+    ctx.fillText('COMBO x' + S.mult, 190 - 4, 55);
+  }
+  /* lives */
+  for (let i = 0; i < 3; i++) {
+    const x = W - 42 - i * 44, y = 40;
+    ctx.save(); ctx.translate(x, y);
+    ctx.fillStyle = i < S.lives ? '#ff5da2' : 'rgba(255,255,255,.16)';
+    ctx.shadowColor = '#ff5da2'; ctx.shadowBlur = i < S.lives ? 12 : 0;
+    ctx.beginPath();
+    ctx.moveTo(0, 12);
+    ctx.bezierCurveTo(-20, -4, -10, -18, 0, -7);
+    ctx.bezierCurveTo(10, -18, 20, -4, 0, 12);
+    ctx.fill(); ctx.restore();
+  }
+}
+
+function centerText(text, y, font, color, glow) {
+  ctx.font = font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = 26; }
+  ctx.fillStyle = color; ctx.fillText(text, W / 2, y);
+  ctx.shadowBlur = 0;
+}
+
+function drawTitle() {
+  ctx.fillStyle = 'rgba(10,4,22,.38)'; ctx.fillRect(0, 0, W, H);
+  centerText('DONUT', 268, '900 96px "Segoe UI", system-ui, sans-serif', '#ff5da2', true);
+  centerText('DASH', 356, '900 96px "Segoe UI", system-ui, sans-serif', '#4dc9ff', true);
+  centerText('🍩  catch the donuts  🍩', 448, '700 25px "Segoe UI", system-ui, sans-serif', '#ffffff');
+  centerText('🥦  dodge the broccoli  🥦', 492, '700 25px "Segoe UI", system-ui, sans-serif', '#a7f3c9');
+  const pulse = 1 + Math.sin(S.time * 4) * 0.045;
+  ctx.save(); ctx.translate(W / 2, 622); ctx.scale(pulse, pulse);
+  ctx.fillStyle = '#ffd166'; ctx.shadowColor = '#ffd166'; ctx.shadowBlur = 24;
+  ctx.beginPath(); ctx.roundRect(-128, -34, 256, 68, 34); ctx.fill();
+  ctx.shadowBlur = 0; ctx.fillStyle = '#241203';
+  ctx.font = '900 30px "Segoe UI", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('▶  PLAY', 0, 2); ctx.restore();
+  centerText('move: mouse · touch · ← →', 726, '600 19px "Segoe UI", system-ui, sans-serif', 'rgba(255,255,255,.65)');
+  centerText('built from ONE prompt by an AI agent', 788, 'italic 600 18px "Segoe UI", system-ui, sans-serif', 'rgba(255,209,102,.8)');
+}
+
+function drawOver() {
+  ctx.fillStyle = 'rgba(10,4,22,.55)'; ctx.fillRect(0, 0, W, H);
+  centerText('GAME OVER', 300, '900 64px "Segoe UI", system-ui, sans-serif', '#ff5da2', true);
+  centerText(String(S.score), 420, '900 120px "Segoe UI", system-ui, sans-serif', '#ffffff', true);
+  centerText('points', 500, '700 24px "Segoe UI", system-ui, sans-serif', '#ffd166');
+  if (S.score >= S.best && S.score > 0) centerText('★ NEW BEST! ★', 556, '800 26px "Segoe UI", system-ui, sans-serif', '#ffd700');
+  else centerText('best: ' + S.best, 556, '700 22px "Segoe UI", system-ui, sans-serif', 'rgba(255,255,255,.7)');
+  const pulse = 1 + Math.sin(S.time * 4) * 0.045;
+  ctx.save(); ctx.translate(W / 2, 668); ctx.scale(pulse, pulse);
+  ctx.fillStyle = '#4dc9ff'; ctx.shadowColor = '#4dc9ff'; ctx.shadowBlur = 24;
+  ctx.beginPath(); ctx.roundRect(-138, -34, 276, 68, 34); ctx.fill();
+  ctx.shadowBlur = 0; ctx.fillStyle = '#06222e';
+  ctx.font = '900 29px "Segoe UI", system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('↻  PLAY AGAIN', 0, 2); ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  drawBG();
+  for (const it of S.items) { if (it.kind === 'broccoli') drawBroccoli(it); else drawDonut(it); }
+  drawCat();
+  for (const p of S.parts) {
+    ctx.globalAlpha = Math.max(0, 1 - p.t / p.life);
+    ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (S.mode !== 'title') drawHUD();
+  for (const p of S.pops) {
+    ctx.globalAlpha = Math.max(0, 1 - p.t / 0.9);
+    ctx.font = (p.big ? '900 34px' : '800 24px') + ' "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = p.color; ctx.shadowBlur = 12;
+    ctx.fillStyle = p.color; ctx.fillText(p.text, p.x, p.y);
+    ctx.shadowBlur = 0;
+  }
+  ctx.globalAlpha = 1;
+  if (S.flash > 0) { ctx.fillStyle = 'rgba(74,222,128,' + (S.flash * 0.35) + ')'; ctx.fillRect(0, 0, W, H); }
+  if (S.mode === 'title') drawTitle();
+  if (S.mode === 'over') drawOver();
+}
+
+/* ---------- input ---------- */
+function toStageX(clientX) {
+  const r = cv.getBoundingClientRect();
+  return (clientX - r.left) * (W / r.width);
+}
+cv.addEventListener('pointermove', e => { S.pointerX = toStageX(e.clientX); });
+cv.addEventListener('pointerdown', e => {
+  audio(); S.pointerX = toStageX(e.clientX);
+  if (S.mode === 'title') startGame();
+  else if (S.mode === 'over' && S.time - S.overAt > 0.4) startGame();
+});
+window.addEventListener('keydown', e => {
+  S.keys[e.code] = true;
+  if ((e.code === 'Space' || e.code === 'Enter')) {
+    audio();
+    if (S.mode === 'title') startGame();
+    else if (S.mode === 'over' && S.time - S.overAt > 0.4) startGame();
+  }
+});
+window.addEventListener('keyup', e => { S.keys[e.code] = false; });
+
+/* ---------- main loop: fixed-step simulation ---------- */
+let last = performance.now(), acc = 0;
+const STEP = 1 / 60;
+function frame(now) {
+  acc += Math.min(0.1, (now - last) / 1000); last = now;
+  while (acc >= STEP) { step(STEP); acc -= STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+/* Demo mode: autoplay, optionally fast-forwarded deterministically by ?t= */
+if (DEMO) {
+  document.body.style.cursor = 'none'; cv.style.cursor = 'none';
+  startGame();
+  const t0 = parseFloat(params.get('t') || '0');
+  if (t0 > 0) { const n = Math.floor(t0 * 60); for (let i = 0; i < n; i++) step(STEP); }
+  document.title = 'DONUT DASH (demo t=' + t0 + ')';
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
